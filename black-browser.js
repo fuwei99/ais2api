@@ -1,30 +1,22 @@
 const Logger = {
   enabled: true,
-  _appendToBody(line) {
-    if (!document.body) return;
-    const logElement = document.createElement("div");
-    logElement.textContent = line;
-    document.body.appendChild(logElement);
-  },
   output(...messages) {
     if (!this.enabled) return;
     const timestamp =
       new Date().toLocaleTimeString("zh-CN", { hour12: false }) +
       "." +
       new Date().getMilliseconds().toString().padStart(3, "0");
-    const line = `[${timestamp}] ${messages.join(" ")}`;
     console.log(`[ProxyClient] ${timestamp}`, ...messages);
-    this._appendToBody(line);
+    const logElement = document.createElement("div");
+    logElement.textContent = `[${timestamp}] ${messages.join(" ")}`;
+    document.body.appendChild(logElement);
   },
 };
 
 class ConnectionManager extends EventTarget {
   // =================================================================
   // ===                 *** 请修改此行   *** ===
-  constructor(
-    endpoint = (typeof window !== "undefined" && window.__PROXY_WS_ENDPOINT) ||
-      "ws://127.0.0.1:9998",
-  ) {
+  constructor(endpoint = "ws://127.0.0.1:9998") {
     // =================================================================
     super();
     this.endpoint = endpoint;
@@ -86,7 +78,7 @@ class ConnectionManager extends EventTarget {
     this.reconnectAttempts++;
     setTimeout(() => {
       Logger.output(`正在进行第 ${this.reconnectAttempts} 次重连尝试...`);
-      this.establish().catch(() => {});
+      this.establish().catch(() => { });
     }, this.reconnectDelay);
   }
 }
@@ -210,9 +202,8 @@ class RequestProcessor {
       }
     }
     const queryString = queryParams.toString();
-    return `https://${this.targetDomain}/${pathSegment}${
-      queryString ? "?" + queryString : ""
-    }`;
+    return `https://${this.targetDomain}/${pathSegment}${queryString ? "?" + queryString : ""
+      }`;
   }
 
   _generateRandomString(length) {
@@ -292,11 +283,7 @@ class ProxySystem extends EventTarget {
     super();
     this.connectionManager = new ConnectionManager(websocketEndpoint);
     this.requestProcessor = new RequestProcessor();
-    if (typeof this._setupEventHandlers === "function") {
-      this._setupEventHandlers();
-    } else {
-      Logger.output("初始化警告: _setupEventHandlers 不存在");
-    }
+    this._setupEventHandlers();
   }
 
   async initialize() {
@@ -465,10 +452,8 @@ class ProxySystem extends EventTarget {
 }
 
 async function initializeProxySystem() {
-  // 清理旧日志（body 可能尚未就绪）
-  if (document.body) {
-    document.body.innerHTML = "";
-  }
+  // 清理旧的日志
+  document.body.innerHTML = "";
   const proxySystem = new ProxySystem();
   try {
     await proxySystem.initialize();
@@ -478,10 +463,4 @@ async function initializeProxySystem() {
   }
 }
 
-if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", () => {
-    initializeProxySystem();
-  });
-} else {
-  initializeProxySystem();
-}
+initializeProxySystem();
