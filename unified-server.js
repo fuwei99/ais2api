@@ -1,4 +1,4 @@
-require("dotenv").config();
+﻿require("dotenv").config();
 const session = require("express-session");
 const cookieParser = require("cookie-parser");
 const crypto = require("crypto");
@@ -171,7 +171,7 @@ class AuthSource {
 
 class BrowserManager {
   constructor(logger, config, authSource) {
-    this.logger = logger;
+    this.baseLogger = logger;
     this.config = config;
     this.authSource = authSource;
     this.browser = null;
@@ -180,6 +180,15 @@ class BrowserManager {
     this.currentAuthIndex = 0;
     this.scriptFileName = "black-browser.js";
     this.noButtonCount = 0;
+    this.instanceRole = this.config.instanceRole || "ACTIVE";
+    this.instanceSlot = this.config.instanceSlot || `slot-${this.config.wsPort}`;
+    this.instanceWsPort = this.config.wsPort;
+    this.logger = {
+      info: (message) => this.baseLogger.info(this._formatInstanceLog(message)),
+      warn: (message) => this.baseLogger.warn(this._formatInstanceLog(message)),
+      error: (message) => this.baseLogger.error(this._formatInstanceLog(message)),
+      debug: (message) => this.baseLogger.debug(this._formatInstanceLog(message)),
+    };
     this.launchArgs = [
       "--disable-dev-shm-usage", // 关键！防止 /dev/shm 空间不足导致浏览器崩溃
       "--disable-gpu",
@@ -211,6 +220,14 @@ class BrowserManager {
         throw new Error(`Unsupported operating system: ${platform}`);
       }
     }
+  }
+
+  _formatInstanceLog(message) {
+    const authPart = this.currentAuthIndex ? `#${this.currentAuthIndex}` : "#-";
+    const tag = `[${this.instanceRole} ${authPart} | ${this.instanceSlot} | ws:${this.instanceWsPort}]`;
+    if (typeof message !== "string") return `${tag} ${String(message)}`;
+    if (message.includes(tag)) return message;
+    return `${tag} ${message}`;
   }
 
   notifyUserActivity() {
@@ -928,6 +945,7 @@ class ConnectionRegistry extends EventEmitter {
     this.connections = new Set();
     this.messageQueues = new Map();
     this.reconnectGraceTimer = null; // 新增：用于缓冲期计时的定时器
+    this.connectionCounter = 0;
   }
   addConnection(websocket, clientInfo) {
     // --- 核心修改：当新连接建立时，清除可能存在的“断开”警报 ---
@@ -938,7 +956,13 @@ class ConnectionRegistry extends EventEmitter {
     }
     // --- 修改结束 ---
 
+    this.connectionCounter += 1;
+    websocket.__connId = this.connectionCounter;
+    websocket.__remote = clientInfo?.address || "unknown";
     this.connections.add(websocket);
+    this.logger.info(
+      `[Server] 内部WS已连接: conn-${websocket.__connId} from ${websocket.__remote}`,
+    );
     websocket.on("message", (data) =>
       this._handleIncomingMessage(data.toString()),
     );
@@ -1204,7 +1228,7 @@ class RequestHandler {
     }
   }
 
-  async _handleRequestFailureAndSwitch(errorDetails, res) {
+  async _handleRequestFailureAndSwitch(errorDetails) {
     // 失败计数逻辑
     if (this.config.failureThreshold > 0) {
       this.failureCount++;
@@ -1232,35 +1256,16 @@ class RequestHandler {
         );
       }
 
-      // [核心修改] 等待切换操作完成，并根据其结果发送不同消息
       try {
         await this._switchToNextAuth();
-        // 如果上面这行代码没有抛出错误，说明切换/回退成功了
-        const successMessage = `🔄 目标账户无效，已自动回退至账号 #${this.currentAuthIndex}。`;
-        this.logger.info(`[Auth] ${successMessage}`);
-        if (res) this._sendErrorChunkToClient(res, successMessage);
+        this.logger.info(`[Auth] 切换完成，当前账号 #${this.currentAuthIndex}`);
+        return true;
       } catch (error) {
-        let userMessage = `❌ 致命错误：发生未知切换错误: ${error.message}`;
-
-        if (error.message.includes("Only one account is available")) {
-          // 场景：单账号无法切换
-          userMessage = "❌ 切换失败：只有一个可用账号。";
-          this.logger.info("[Auth] 只有一个可用账号，失败计数已重置。");
-          this.failureCount = 0;
-        } else if (error.message.includes("回退失败原因")) {
-          // 场景：切换到坏账号后，连回退都失败了
-          userMessage = `❌ 致命错误：自动切换和紧急回退均失败，服务可能已中断，请检查日志！`;
-        } else if (error.message.includes("切换到账号")) {
-          // 场景：切换到坏账号后，成功回退（这是一个伪“成功”，本质是上一个操作失败了）
-          userMessage = `⚠️ 自动切换失败：已自动回退到账号 #${this.currentAuthIndex}，请检查目标账号是否存在问题。`;
-        }
-
         this.logger.error(`[Auth] 后台账号切换任务最终失败: ${error.message}`);
-        if (res) this._sendErrorChunkToClient(res, userMessage);
+        return false;
       }
-
-      return;
     }
+    return false;
   }
 
   async processRequest(req, res) {
@@ -1453,14 +1458,30 @@ class RequestHandler {
     const messageQueue = this.connectionRegistry.createMessageQueue(requestId);
 
     try {
-      this._forwardRequest(proxyRequest);
-      const initialMessage = await messageQueue.dequeue();
+      let initialMessage = null;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        this._forwardRequest(proxyRequest);
+        initialMessage = await messageQueue.dequeue();
+        if (initialMessage.event_type !== "error") break;
+
+        this.logger.error(
+          `[Adapter] 收到来自浏览器的错误(尝试 ${attempt}/2)，状态码: ${initialMessage.status}, 消息: ${initialMessage.message}`,
+        );
+        const switched = await this._handleRequestFailureAndSwitch(initialMessage);
+        const allowImmediateRetry =
+          attempt === 1 &&
+          switched &&
+          this.config.immediateSwitchStatusCodes.includes(initialMessage.status);
+        if (allowImmediateRetry) {
+          this.logger.warn(
+            `[Adapter] 立即切号后重试当前请求，状态码: ${initialMessage.status}`,
+          );
+          continue;
+        }
+        break;
+      }
 
       if (initialMessage.event_type === "error") {
-        this.logger.error(
-          `[Adapter] 收到来自浏览器的错误，将触发切换逻辑。状态码: ${initialMessage.status}, 消息: ${initialMessage.message}`,
-        );
-        await this._handleRequestFailureAndSwitch(initialMessage, res);
         if (isOpenAIStream) {
           if (!res.writableEnded) {
             res.write("data: [DONE]\n\n");
@@ -1757,6 +1778,9 @@ class RequestHandler {
   _forwardRequest(proxyRequest) {
     const connection = this.connectionRegistry.getFirstConnection();
     if (connection) {
+      this.logger.info(
+        `[Request] 分发到 conn-${connection.__connId || "?"}, requestId=${proxyRequest.request_id}`,
+      );
       connection.send(JSON.stringify(proxyRequest));
     } else {
       throw new Error("无法转发请求：没有可用的WebSocket连接。");
@@ -1867,7 +1891,7 @@ class RequestHandler {
           this.logger.error(
             `[Request] 所有 ${this.maxRetries} 次重试均失败，将计入失败统计。`,
           );
-          await this._handleRequestFailureAndSwitch(lastMessage, res);
+          await this._handleRequestFailureAndSwitch(lastMessage);
           this._sendErrorChunkToClient(
             res,
             `请求最终失败: ${lastMessage.message}`,
@@ -1928,7 +1952,7 @@ class RequestHandler {
         );
       } else {
         this.logger.error(`[Request] 请求失败，将计入失败统计。`);
-        await this._handleRequestFailureAndSwitch(headerMessage, null);
+        await this._handleRequestFailureAndSwitch(headerMessage);
         return this._sendErrorResponse(
           res,
           headerMessage.status,
@@ -2006,7 +2030,7 @@ class RequestHandler {
           this.logger.error(
             `[Request] 浏览器端返回错误: ${headerMessage.message}`,
           );
-          await this._handleRequestFailureAndSwitch(headerMessage, null);
+          await this._handleRequestFailureAndSwitch(headerMessage);
         }
         return this._sendErrorResponse(
           res,
