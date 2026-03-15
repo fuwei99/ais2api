@@ -316,6 +316,10 @@ class BrowserManager {
         viewport: { width: 1920, height: 1080 },
       });
       this.page = await this.context.newPage();
+      await this.page.addInitScript((endpoint) => {
+        window.__PROXY_WS_ENDPOINT = endpoint;
+      }, `ws://127.0.0.1:${this.config.wsPort}`);
+      await this.page.addInitScript({ content: buildScriptContent });
       this.page.on("console", (msg) => {
         const msgText = msg.text();
         if (msgText.includes("Content-Security-Policy: (Report-Only policy)")) {
@@ -946,6 +950,7 @@ class ConnectionRegistry extends EventEmitter {
     this.messageQueues = new Map();
     this.reconnectGraceTimer = null; // 新增：用于缓冲期计时的定时器
     this.connectionCounter = 0;
+    this.roundRobinIndex = 0;
   }
   addConnection(websocket, clientInfo) {
     // --- 核心修改：当新连接建立时，清除可能存在的“断开”警报 ---
@@ -959,12 +964,14 @@ class ConnectionRegistry extends EventEmitter {
     this.connectionCounter += 1;
     websocket.__connId = this.connectionCounter;
     websocket.__remote = clientInfo?.address || "unknown";
+    websocket.__wsPort = clientInfo?.wsPort;
+    websocket.__managerIndex = clientInfo?.managerIndex;
     this.connections.add(websocket);
     this.logger.info(
-      `[Server] 内部WS已连接: conn-${websocket.__connId} from ${websocket.__remote}`,
+      `[Server] 内部WS已连接: conn-${websocket.__connId} from ${websocket.__remote} (ws:${websocket.__wsPort ?? "?"}, manager:${websocket.__managerIndex ?? "?"})`,
     );
     websocket.on("message", (data) =>
-      this._handleIncomingMessage(data.toString()),
+      this._handleIncomingMessage(data.toString(), websocket),
     );
     websocket.on("close", () => this._removeConnection(websocket));
     websocket.on("error", (error) =>
@@ -975,7 +982,9 @@ class ConnectionRegistry extends EventEmitter {
 
   _removeConnection(websocket) {
     this.connections.delete(websocket);
-    this.logger.warn("[Server] 内部WebSocket客户端连接断开。");
+    this.logger.warn(
+      `[Server] 内部WebSocket客户端连接断开: conn-${websocket.__connId || "?"} (ws:${websocket.__wsPort ?? "?"}, manager:${websocket.__managerIndex ?? "?"})。`,
+    );
 
     // --- 核心修改：不立即清理队列，而是启动一个缓冲期 ---
     this.logger.info("[Server] 启动5秒重连缓冲期...");
@@ -992,7 +1001,7 @@ class ConnectionRegistry extends EventEmitter {
     this.emit("connectionRemoved", websocket);
   }
 
-  _handleIncomingMessage(messageData) {
+  _handleIncomingMessage(messageData, websocket = null) {
     try {
       const parsedMessage = JSON.parse(messageData);
       const requestId = parsedMessage.request_id;
@@ -1002,6 +1011,9 @@ class ConnectionRegistry extends EventEmitter {
       }
       const queue = this.messageQueues.get(requestId);
       if (queue) {
+        if (websocket && websocket.__connId) {
+          parsedMessage.__connId = websocket.__connId;
+        }
         this._routeMessage(parsedMessage, queue);
       } else {
         // 在缓冲期内，旧的请求队列可能仍然存在，但连接已经改变，这可能会导致找不到队列。
@@ -1034,6 +1046,30 @@ class ConnectionRegistry extends EventEmitter {
   }
   getFirstConnection() {
     return this.connections.values().next().value;
+  }
+  getConnectionById(connId) {
+    if (!connId) return null;
+    for (const conn of this.connections) {
+      if (conn.__connId === connId) return conn;
+    }
+    return null;
+  }
+  getNextConnection(avoidConnId = null) {
+    const list = Array.from(this.connections);
+    if (list.length === 0) return null;
+    const start = this.roundRobinIndex % list.length;
+    for (let i = 0; i < list.length; i++) {
+      const idx = (start + i) % list.length;
+      const conn = list[idx];
+      if (avoidConnId && conn.__connId === avoidConnId && list.length > 1) {
+        continue;
+      }
+      this.roundRobinIndex = (idx + 1) % list.length;
+      return conn;
+    }
+    const fallback = list[start];
+    this.roundRobinIndex = (start + 1) % list.length;
+    return fallback;
   }
   createMessageQueue(requestId) {
     const queue = new MessageQueue();
@@ -1071,10 +1107,11 @@ class RequestHandler {
     this.isAuthSwitching = false;
     this.needsSwitchingAfterRequest = false;
     this.isSystemBusy = false;
+    this.requestConnMap = new Map();
   }
 
   get currentAuthIndex() {
-    return this.browserManager.currentAuthIndex;
+    return this.serverSystem.getActiveBrowserManager().currentAuthIndex;
   }
 
   _getMaxAuthIndex() {
@@ -1250,6 +1287,17 @@ class RequestHandler {
         this.logger.warn(
           `🔴 [Auth] 收到状态码 ${errorDetails.status}，触发立即切换账号...`,
         );
+        if (this.config.instanceNum > 1) {
+          const badConnId = errorDetails.__connId || null;
+          if (badConnId) {
+            this.serverSystem
+              .recycleInstanceByConnectionId(badConnId)
+              .catch((err) =>
+                this.logger.error(`[BrowserPool] 回收实例失败: ${err.message}`),
+              );
+          }
+          return true;
+        }
       } else {
         this.logger.warn(
           `🔴 [Auth] 达到失败阈值 (${this.failureCount}/${this.config.failureThreshold})！准备切换账号...`,
@@ -1269,9 +1317,7 @@ class RequestHandler {
   }
 
   async processRequest(req, res) {
-    if (this.browserManager) {
-      this.browserManager.notifyUserActivity();
-    }
+    this.serverSystem.notifyAllUserActivity();
     const requestId = this._generateRequestId();
     res.on("close", () => {
       if (!res.writableEnded) {
@@ -1389,6 +1435,7 @@ class RequestHandler {
     } catch (error) {
       this._handleRequestError(error, res);
     } finally {
+      this.requestConnMap.delete(requestId);
       this.connectionRegistry.removeMessageQueue(requestId);
       if (this.needsSwitchingAfterRequest) {
         this.logger.info(
@@ -1403,9 +1450,7 @@ class RequestHandler {
   }
 
   async processOpenAIRequest(req, res) {
-    if (this.browserManager) {
-      this.browserManager.notifyUserActivity();
-    }
+    this.serverSystem.notifyAllUserActivity();
     const requestId = this._generateRequestId();
     const isOpenAIStream = req.body.stream === true;
     const model = req.body.model || "gemini-1.5-pro-latest";
@@ -1459,7 +1504,9 @@ class RequestHandler {
 
     try {
       let initialMessage = null;
+      let avoidConnId = null;
       for (let attempt = 1; attempt <= 2; attempt++) {
+        proxyRequest.__avoid_conn_id = avoidConnId;
         this._forwardRequest(proxyRequest);
         initialMessage = await messageQueue.dequeue();
         if (initialMessage.event_type !== "error") break;
@@ -1473,8 +1520,9 @@ class RequestHandler {
           switched &&
           this.config.immediateSwitchStatusCodes.includes(initialMessage.status);
         if (allowImmediateRetry) {
+          avoidConnId = initialMessage.__connId || null;
           this.logger.warn(
-            `[Adapter] 立即切号后重试当前请求，状态码: ${initialMessage.status}`,
+            `[Adapter] 立即切号后重试当前请求，状态码: ${initialMessage.status}, 避让连接: conn-${avoidConnId || "?"}`,
           );
           continue;
         }
@@ -1652,6 +1700,7 @@ class RequestHandler {
     } catch (error) {
       this._handleRequestError(error, res);
     } finally {
+      this.requestConnMap.delete(requestId);
       this.connectionRegistry.removeMessageQueue(requestId);
       if (this.needsSwitchingAfterRequest) {
         this.logger.info(
@@ -1670,7 +1719,10 @@ class RequestHandler {
 
   // --- 新增一个辅助方法，用于发送取消指令 ---
   _cancelBrowserRequest(requestId) {
-    const connection = this.connectionRegistry.getFirstConnection();
+    const connId = this.requestConnMap.get(requestId) || null;
+    const connection =
+      this.connectionRegistry.getConnectionById(connId) ||
+      this.connectionRegistry.getFirstConnection();
     if (connection) {
       this.logger.info(
         `[Request] 正在向浏览器发送取消请求 #${requestId} 的指令...`,
@@ -1776,10 +1828,12 @@ class RequestHandler {
     };
   }
   _forwardRequest(proxyRequest) {
-    const connection = this.connectionRegistry.getFirstConnection();
+    const avoidConnId = proxyRequest.__avoid_conn_id || null;
+    const connection = this.connectionRegistry.getNextConnection(avoidConnId);
     if (connection) {
+      this.requestConnMap.set(proxyRequest.request_id, connection.__connId);
       this.logger.info(
-        `[Request] 分发到 conn-${connection.__connId || "?"}, requestId=${proxyRequest.request_id}`,
+        `[Request] 分发到 conn-${connection.__connId || "?"} (ws:${connection.__wsPort || "?"}, manager:${connection.__managerIndex ?? "?"}), requestId=${proxyRequest.request_id}`,
       );
       connection.send(JSON.stringify(proxyRequest));
     } else {
@@ -2479,11 +2533,8 @@ class ProxyServerSystem extends EventEmitter {
     this.forceThinking = false;
 
     this.authSource = new AuthSource(this.logger);
-    this.browserManager = new BrowserManager(
-      this.logger,
-      this.config,
-      this.authSource,
-    );
+    this.browserManagers = [];
+    this.browserManager = null;
     this.connectionRegistry = new ConnectionRegistry(this.logger);
     this.requestHandler = new RequestHandler(
       this,
@@ -2495,7 +2546,8 @@ class ProxyServerSystem extends EventEmitter {
     );
 
     this.httpServer = null;
-    this.wsServer = null;
+    this.wsServers = [];
+    this.recycleCursor = 0;
   }
 
   // ===== 所有函数都已正确放置在类内部 =====
@@ -2560,6 +2612,10 @@ class ProxyServerSystem extends EventEmitter {
     if (process.env.HTTP_PROXY) {
       config.httpProxy = process.env.HTTP_PROXY;
     }
+    const instanceNumRaw = parseInt(process.env.INSTANCE_NUM || "1", 10);
+    config.instanceNum = Number.isFinite(instanceNumRaw)
+      ? Math.max(1, Math.min(instanceNumRaw, 16))
+      : 1;
 
     let rawCodes = process.env.IMMEDIATE_SWITCH_STATUS_CODES;
     let codesSource = "环境变量";
@@ -2652,6 +2708,7 @@ class ProxyServerSystem extends EventEmitter {
     this.logger.info(`  单次请求最大重试: ${this.config.maxRetries}次`);
     this.logger.info(`  重试间隔: ${this.config.retryDelay}ms`);
     this.logger.info(`  API 密钥来源: ${this.config.apiKeySource}`); // 在启动日志中也显示出来
+    this.logger.info(`  实例数量: ${this.config.instanceNum}`);
     if (this.config.httpProxy) {
       const maskedProxy = this.config.httpProxy.replace(/:[^:@/]+@/, ":****@");
       this.logger.info(`  浏览器代理: ${maskedProxy}`);
@@ -2667,7 +2724,7 @@ class ProxyServerSystem extends EventEmitter {
     // <<<--- 1. 重新接收参数
     this.logger.info("[System] 开始弹性启动流程...");
     await this._startHttpServer();
-    await this._startWebSocketServer();
+    await this._startWebSocketServers();
     this.logger.info("[System] 准备加载浏览器...");
     const allAvailableIndices = this.authSource.availableIndices;
 
@@ -2699,30 +2756,91 @@ class ProxyServerSystem extends EventEmitter {
       );
     }
 
-    let isStarted = false;
-    // 3. <<<--- 遍历这个新的、可能被重排过的顺序列表 --->>>
-    for (const index of startupOrder) {
-      try {
-        this.logger.info(`[System] 尝试使用账号 #${index} 启动服务...`);
-        await this.browserManager.launchOrSwitchContext(index);
+    let startedCount = 0;
+    const targetCount = this.config.instanceNum;
+    for (let i = 0; i < targetCount; i++) {
+      const wsPort = this.config.wsPort + i;
+      const slotAuth = startupOrder[i % startupOrder.length];
+      const managerConfig = {
+        ...this.config,
+        wsPort,
+        instanceRole: i === 0 ? "ACTIVE" : "STANDBY",
+        instanceSlot: `slot-${wsPort}`,
+      };
+      const manager = new BrowserManager(this.logger, managerConfig, this.authSource);
+      this.browserManagers[i] = manager;
+      if (i === 0) {
+        this.browserManager = manager;
+        this.requestHandler.browserManager = manager;
+      }
 
-        isStarted = true;
-        this.logger.info(`[System] ✅ 使用账号 #${index} 成功启动！`);
-        break; // 成功启动，跳出循环
+      try {
+        this.logger.info(
+          `[System] 尝试启动实例 slot-${wsPort} (账号 #${slotAuth})...`,
+        );
+        await manager.launchOrSwitchContext(slotAuth);
+        startedCount++;
       } catch (error) {
         this.logger.error(
-          `[System] ❌ 使用账号 #${index} 启动失败。原因: ${error.message}`,
+          `[System] ❌ 启动实例 slot-${wsPort} 失败: ${error.message}`,
         );
-        // 失败了，循环将继续，尝试下一个账号
       }
     }
 
-    if (!isStarted) {
+    if (startedCount === 0) {
       // 如果所有账号都尝试失败了
       throw new Error("所有认证源均尝试失败，服务器无法启动。");
     }
+    this.logger.info(`[BrowserPool] Ready instances: ${startedCount}/${targetCount}`);
     this.logger.info(`[System] 代理服务器系统启动完成。`);
     this.emit("started");
+  }
+
+  getActiveBrowserManager() {
+    return this.browserManager || this.browserManagers[0];
+  }
+
+  notifyAllUserActivity() {
+    this.browserManagers.forEach((m) => {
+      try {
+        m.notifyUserActivity();
+      } catch (e) {}
+    });
+  }
+
+  _pickNextAuthIndex(excludeIndex = null) {
+    const available = this.authSource.availableIndices || [];
+    if (available.length === 0) return null;
+    for (let i = 0; i < available.length; i++) {
+      const idx = (this.recycleCursor + i) % available.length;
+      const candidate = available[idx];
+      if (excludeIndex && available.length > 1 && candidate === excludeIndex) {
+        continue;
+      }
+      this.recycleCursor = (idx + 1) % available.length;
+      return candidate;
+    }
+    return available[0];
+  }
+
+  async recycleInstanceByConnectionId(connId) {
+    const connection = this.connectionRegistry.getConnectionById(connId);
+    if (!connection) return;
+    const managerIndex = connection.__managerIndex;
+    if (managerIndex === undefined || managerIndex === null) return;
+    const manager = this.browserManagers[managerIndex];
+    if (!manager) return;
+
+    const oldAuth = manager.currentAuthIndex || null;
+    const nextAuth = this._pickNextAuthIndex(oldAuth);
+    if (!nextAuth) return;
+
+    this.logger.info(
+      `[BrowserPool] 回收实例 manager:${managerIndex}, conn:${connId}, auth:${oldAuth || "-"} -> ${nextAuth}`,
+    );
+    await manager.closeBrowser();
+    await manager.launchOrSwitchContext(nextAuth);
+    this.logger.info(`[Auth] One instance has been recycled.`);
   }
 
   _createAuthMiddleware() {
@@ -3217,16 +3335,26 @@ class ProxyServerSystem extends EventEmitter {
     return app;
   }
 
-  async _startWebSocketServer() {
-    this.wsServer = new WebSocket.Server({
-      port: this.config.wsPort,
-      host: this.config.host,
-    });
-    this.wsServer.on("connection", (ws, req) => {
-      this.connectionRegistry.addConnection(ws, {
-        address: req.socket.remoteAddress,
+  async _startWebSocketServers() {
+    const count = this.config.instanceNum || 1;
+    for (let i = 0; i < count; i++) {
+      const wsPort = this.config.wsPort + i;
+      const wsServer = new WebSocket.Server({
+        port: wsPort,
+        host: this.config.host,
       });
-    });
+      wsServer.on("connection", (ws, req) => {
+        this.connectionRegistry.addConnection(ws, {
+          address: req.socket.remoteAddress,
+          wsPort,
+          managerIndex: i,
+        });
+      });
+      this.wsServers.push(wsServer);
+      this.logger.info(
+        `[System] WS listener started on ws://${this.config.host}:${wsPort}`,
+      );
+    }
   }
 }
 
